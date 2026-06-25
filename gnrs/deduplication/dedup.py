@@ -44,6 +44,37 @@ def group_by_spg(structs: dict[str, Atoms]) -> dict[int, dict[str, Atoms]]:
     return groups
 
 
+def group_by_volume(
+    structs: dict[str, Atoms],
+    vol_tol: float = 0.05,
+) -> list[dict[str, Atoms]]:
+    """
+    Sub-group structures by unit cell volume within a relative tolerance.
+    Structures whose volumes differ by more than vol_tol cannot be duplicates.
+
+    Args:
+        structs: {name: Atoms}.
+        vol_tol: Relative volume tolerance (default 0.05 = 5%).
+
+    Returns:
+        List of sub-group dicts.
+    """
+    items = sorted(structs.items(), key=lambda kv: kv[1].get_volume())
+    buckets: list[dict[str, Atoms]] = []
+    for name, xtal in items:
+        vol = xtal.get_volume()
+        placed = False
+        for bucket in buckets:
+            ref_vol = next(iter(bucket.values())).get_volume()
+            if abs(vol - ref_vol) / ref_vol <= vol_tol:
+                bucket[name] = xtal
+                placed = True
+                break
+        if not placed:
+            buckets.append({name: xtal})
+    return buckets
+
+
 def _select(
     candidates: dict[str, Atoms],
     energy_key: str | None
