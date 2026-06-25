@@ -50,9 +50,8 @@ class Genarris:
         self._gnrs_info_init()
         self._config_init(args)
         restart_init(self.comm, self.config, self.gnrs_info)
-        if not self.restart:
-            self._folders_init()
-        else:
+        self._folders_init()
+        if self.restart:
             self.attempt_restart()
 
         self.comm.barrier()
