@@ -24,6 +24,7 @@ from pymatgen.analysis.structure_matcher import StructureMatcher
 from pymatgen.io.ase import AseAtomsAdaptor
 
 import gnrs.parallel as gp
+import gnrs.output as gout
 
 _TAG_WORK = 50
 _TAG_RESULT = 51
@@ -158,10 +159,14 @@ def dedup_parallel(
                 gp.comm.send(None, dest=worker, tag=_TAG_SHUTDOWN)
                 active -= 1
 
+        total = len(all_buckets)
+        done = 0
         while active > 0:
             status = MPI.Status()
             result = gp.comm.recv(source=MPI.ANY_SOURCE, tag=_TAG_RESULT, status=status)
             kept.update(result)
+            done += 1
+            gout.emit(f"Dedup: {done}/{total} buckets done, {len(kept)} unique so far")
             worker = status.Get_source()
             if queue:
                 gp.comm.send(queue.pop(0), dest=worker, tag=_TAG_WORK)
