@@ -18,7 +18,12 @@ __group__ = "https://www.noamarom.com/"
 import logging
 from typing import Optional
 
-import torch
+try:
+    import torch
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
+
 from mpi4py import MPI
 
 logger = logging.getLogger("gpu")
@@ -59,7 +64,7 @@ class GPUDeviceManager:
         self.rank = comm.Get_rank()
         self.size = comm.Get_size()
 
-        self.num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        self.num_gpus = torch.cuda.device_count() if (_TORCH_AVAILABLE and torch.cuda.is_available()) else 0
         self.max_workers_per_gpu = max_workers_per_gpu
 
         self._num_workers = min(
@@ -91,7 +96,8 @@ class GPUDeviceManager:
 
         gpu_id = self.rank % self.num_gpus
         self._device = f"cuda:{gpu_id}"
-        torch.cuda.set_device(gpu_id)
+        if _TORCH_AVAILABLE:
+            torch.cuda.set_device(gpu_id)
 
     @property
     def device(self) -> str:
