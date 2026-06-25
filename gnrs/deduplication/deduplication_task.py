@@ -20,7 +20,7 @@ import gnrs.output as gout
 import gnrs.parallel as gp
 from gnrs.core.task import TaskABC
 from gnrs.parallel.structs import DistributedStructs
-from gnrs.deduplication.dedup import group_by_spg, group_by_volume, dedup_parallel
+from gnrs.deduplication.dedup import group_by_spg, dedup_parallel
 
 logger = logging.getLogger("DuplicateRemovalTask")
 
@@ -112,27 +112,20 @@ class DuplicateRemovalTask(TaskABC):
 
         all_structs = gp.comm.gather(self.structs, root=0)
 
-        # Build all volume buckets on master
-        all_buckets = []
+        spg_groups = {}
         if gp.is_master:
             combined = {}
             for d in all_structs:
                 combined.update(d)
             n_structs = len(combined)
-
             if use_spg_groups:
                 spg_groups = group_by_spg(combined)
                 gout.emit(f"Deduplicating {n_structs} structures across {len(spg_groups)} space groups")
-                for pool in spg_groups.values():
-                    all_buckets.extend(group_by_volume(pool))
             else:
+                spg_groups = {None: combined}
                 gout.emit(f"Deduplicating all {n_structs} structures")
-                all_buckets = group_by_volume(combined)
 
-        unique = dedup_parallel(
-            all_buckets if gp.is_master else [],
-            matcher, energy_key,
-        )
+        unique = dedup_parallel(spg_groups, matcher, energy_key)
 
         # Scatter deduplicated pool back across ranks
         ds = DistributedStructs(unique)

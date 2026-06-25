@@ -129,29 +129,31 @@ def _scatter_structs(pool: dict[str, Atoms]) -> dict[str, Atoms]:
 
 
 def dedup_parallel(
-    all_buckets: list[dict[str, Atoms]],
+    spg_groups: dict[int, dict[str, Atoms]],
     matcher: StructureMatcher,
     energy_key: str | None,
 ) -> dict[str, Atoms]:
     """
-    Dispatch buckets dynamically to worker ranks (rank 0 = dispatcher).
-    Each worker processes one bucket at a time and requests the next
-    when done. No MPI inside the per-bucket dedup loop.
+    Dispatch one spg pool at a time to worker ranks (rank 0 = dispatcher).
+    Each worker receives one spg pool, splits it into volume buckets,
+    and deduplicates each bucket sequentially — no MPI inside.
 
     Args:
-        all_buckets: List of buckets (only meaningful on rank 0).
+        spg_groups: {spg: {name: Atoms}} (only meaningful on rank 0).
         matcher: StructureMatcher instance.
         energy_key: Energy key for selecting best duplicate.
 
     Returns:
-        Combined unique structures (all ranks).
+        Combined unique structures (broadcast to all ranks).
     """
     if gp.is_master:
-        queue = list(all_buckets)
+        queue = list(spg_groups.items())  # [(spg, pool), ...]
         kept = {}
-        active = gp.size - 1  # worker ranks 1..size-1
+        active = gp.size - 1
 
-        # Send initial bucket to each worker
+        total = len(queue)
+        done = 0
+
         for worker in range(1, gp.size):
             if queue:
                 gp.comm.send(queue.pop(0), dest=worker, tag=_TAG_WORK)
@@ -159,14 +161,12 @@ def dedup_parallel(
                 gp.comm.send(None, dest=worker, tag=_TAG_SHUTDOWN)
                 active -= 1
 
-        total = len(all_buckets)
-        done = 0
         while active > 0:
             status = MPI.Status()
             result = gp.comm.recv(source=MPI.ANY_SOURCE, tag=_TAG_RESULT, status=status)
             kept.update(result)
             done += 1
-            gout.emit(f"Dedup: {done}/{total} buckets done, {len(kept)} unique so far")
+            gout.emit(f"Dedup: {done}/{total} spgs done, {len(kept)} unique so far")
             worker = status.Get_source()
             if queue:
                 gp.comm.send(queue.pop(0), dest=worker, tag=_TAG_WORK)
@@ -180,12 +180,14 @@ def dedup_parallel(
         kept = {}
         while True:
             status = MPI.Status()
-            bucket = gp.comm.recv(source=0, tag=MPI.ANY_TAG, status=status)
+            item = gp.comm.recv(source=0, tag=MPI.ANY_TAG, status=status)
             if status.Get_tag() == _TAG_SHUTDOWN:
                 break
-            kept.update(dedup_bucket(bucket, matcher, energy_key))
+            spg, pool = item
+            for bucket in group_by_volume(pool):
+                kept.update(dedup_bucket(bucket, matcher, energy_key))
             gp.comm.send(kept, dest=0, tag=_TAG_RESULT)
-            kept = {}  # reset after sending
+            kept = {}
 
         return gp.comm.bcast(None, root=0)
 
