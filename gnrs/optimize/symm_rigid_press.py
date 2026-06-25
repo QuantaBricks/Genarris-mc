@@ -48,6 +48,7 @@ class SYMM_RIGID_PRESSOptimizer(GeometryOptimizerABC):
         self.debug_flag = self.tsk_set["debug_flag"]
         self.mol_path = self.tsk_set["mol_path"]
         self.cutoff_matrix = self.tsk_set["cutoff_matrix"]
+        self.mol = read(self.mol_path, format="aims", parallel=False)
 
     def initialize(self) -> None:
         """
@@ -64,7 +65,7 @@ class SYMM_RIGID_PRESSOptimizer(GeometryOptimizerABC):
         """
         if self.debug_flag:
             xtal.write("geometry.in", parallel=False)
-        mol = read(self.mol_path, parallel=False)
+        mol = self.mol
         opt = RigidPressSymm(
             mol=mol,
             xtal=xtal,
