@@ -20,9 +20,9 @@ _TASK_TYPES = {
     "dedup": ("gnrs.deduplication", "DuplicateRemovalTask"),
 }
 
-_ENERGY_METHODS = {"maceoff", "uma", "aimnet", "aims", "vasp", "dftb"}
+_ENERGY_METHODS = {"maceoff", "uma", "aimnet", "aims", "vasp", "dftb", "gfnff"}
 
-_OPTIMIZERS = {"bfgs", "lbfgs"}
+_OPTIMIZERS = {"bfgs", "lbfgs", "xtb"}
 
 _RIGID_PRESS_OPTIMIZERS = {"rigid_press", "symm_rigid_press"}
 
