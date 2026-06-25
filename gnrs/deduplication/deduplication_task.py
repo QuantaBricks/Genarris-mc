@@ -20,7 +20,7 @@ import gnrs.output as gout
 import gnrs.parallel as gp
 from gnrs.core.task import TaskABC
 from gnrs.parallel.structs import DistributedStructs
-from gnrs.deduplication.dedup import group_by_spg, group_by_volume, dedup_group
+from gnrs.deduplication.dedup import group_by_spg, group_by_volume, dedup_bucket
 
 logger = logging.getLogger("DuplicateRemovalTask")
 
@@ -112,43 +112,44 @@ class DuplicateRemovalTask(TaskABC):
 
         all_structs = gp.comm.gather(self.structs, root=0)
 
-        combined = {}
+        # Build all volume buckets on master, scatter to ranks
+        buckets = None
+        n_structs = 0
         if gp.is_master:
+            combined = {}
             for d in all_structs:
                 combined.update(d)
-            del all_structs
+            n_structs = len(combined)
 
-        if use_spg_groups:
-            spg_groups = {}
-            spg_keys = []
-            if gp.is_master:
+            if use_spg_groups:
                 spg_groups = group_by_spg(combined)
-                spg_keys = sorted(spg_groups.keys())
-                gout.emit(f"Deduplicating {len(combined)} structures across {len(spg_keys)} space groups")
-                del combined
+                gout.emit(f"Deduplicating {n_structs} structures across {len(spg_groups)} space groups")
+                all_buckets = []
+                for pool in spg_groups.values():
+                    all_buckets.extend(group_by_volume(pool))
+            else:
+                gout.emit(f"Deduplicating all {n_structs} structures")
+                all_buckets = group_by_volume(combined)
 
-            spg_keys = gp.comm.bcast(spg_keys, root=0)
+            # Distribute buckets round-robin across ranks
+            buckets = [[] for _ in range(gp.size)]
+            for i, bucket in enumerate(all_buckets):
+                buckets[i % gp.size].append(bucket)
 
-            unique = {}
-            for spg in spg_keys:
-                pool = spg_groups.pop(spg, {}) if gp.is_master else {}
-                # Pre-filter by volume: structures with different volumes
-                # cannot be duplicates, so dedup each volume bucket separately.
-                vol_buckets = group_by_volume(pool) if gp.is_master else [{}]
-                n_buckets = gp.comm.bcast(len(vol_buckets), root=0)
-                for i in range(n_buckets):
-                    bucket = vol_buckets[i] if gp.is_master else {}
-                    kept = dedup_group(bucket, matcher, spg, energy_key)
-                    unique.update(kept)
-        else:
-            if gp.is_master:
-                gout.emit(
-                    f"Deduplicating all {len(combined)} structures"
-                )
-            unique = dedup_group(
-                combined if gp.is_master else {},
-                matcher, None, energy_key,
-            )
+        my_buckets = gp.comm.scatter(buckets, root=0)
+
+        # Each rank deduplicates its buckets independently — no MPI inside
+        kept = {}
+        for bucket in my_buckets:
+            kept.update(dedup_bucket(bucket, matcher, energy_key))
+
+        # Gather unique structures from all ranks
+        all_kept = gp.comm.gather(kept, root=0)
+        unique = {}
+        if gp.is_master:
+            for d in all_kept:
+                unique.update(d)
+        unique = gp.comm.bcast(unique, root=0)
 
         # Scatter deduplicated pool back across ranks
         ds = DistributedStructs(unique)

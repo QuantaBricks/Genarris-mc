@@ -122,78 +122,33 @@ def _scatter_structs(pool: dict[str, Atoms]) -> dict[str, Atoms]:
     return gp.comm.scatter(scatter_list, root=0)
 
 
-def dedup_group(
-    pool: dict[str, Atoms],
+def dedup_bucket(
+    bucket: dict[str, Atoms],
     matcher: StructureMatcher,
-    spg: int | None,
     energy_key: str | None,
 ) -> dict[str, Atoms]:
     """
-    Remove duplicates from a space group in parallel.
-
-    1. Master picks one candidate from the pool and broadcasts its
-        pymatgen Structure to all ranks.
-    2. The remaining structures are scattered across ranks; each rank
-        tests matcher.fit(candidate, local_struct) in parallel.
-    3. Match results are gathered. Master collects the duplicate
-        cluster, selects the best structure, and removes
-        duplicates from the pool until the pool is empty.
+    Deduplicate a single volume bucket on one rank, no MPI.
 
     Args:
-        pool: {name: Atoms} — all structures in this space group
-            (only meaningful on master; ignored on workers).
+        bucket: {name: Atoms} structures in this volume bucket.
         matcher: Configured StructureMatcher instance.
-        spg: Space group.
         energy_key: Key in Atoms.info for energy, or None.
 
     Returns:
-        {name: Atoms} — unique structures in the space group.
+        {name: Atoms} unique structures.
     """
+    pool = dict(bucket)
     kept = {}
-
-    while True:
-        n_rem = len(pool) if gp.is_master else 0
-        n_rem = gp.comm.bcast(n_rem, root=0)
-        if n_rem == 0:
-            break
-
-        if gp.is_master:
-            ref_name = next(iter(pool))
-            ref_xtal = pool.pop(ref_name)
-            pmg_ref = AseAtomsAdaptor.get_structure(ref_xtal)
-        else:
-            ref_name = None
-            ref_xtal = None
-            pmg_ref = None
-
-        ref_name = gp.comm.bcast(ref_name, root=0)
-        ref_xtal = gp.comm.bcast(ref_xtal, root=0)
-        pmg_ref = gp.comm.bcast(pmg_ref, root=0)
-
-        local_chunk = _scatter_structs(pool if gp.is_master else {})
-
-        local_matches = []
-        for name, xtal in local_chunk.items():
-            pmg_xtal = AseAtomsAdaptor.get_structure(xtal)
+    while pool:
+        ref_name, ref_xtal = next(iter(pool.items()))
+        pool.pop(ref_name)
+        pmg_ref = AseAtomsAdaptor.get_structure(ref_xtal)
+        cluster = {ref_name: ref_xtal}
+        for name in list(pool.keys()):
+            pmg_xtal = AseAtomsAdaptor.get_structure(pool[name])
             if matcher.fit(pmg_ref, pmg_xtal):
-                local_matches.append(name)
-
-        all_matches = gp.comm.gather(local_matches, root=0)
-
-        if gp.is_master:
-            match_names = set()
-            for sublist in all_matches:
-                match_names.update(sublist)
-
-            cluster = {ref_name: ref_xtal}
-            for mn in match_names:
-                cluster[mn] = pool.pop(mn)
-
-            best = _select(cluster, energy_key)
-            kept[best] = cluster[best]
-
-            tag = f"SPG {spg}" if spg is not None else "ALL"
-            logger.debug(f"{tag}: remaining pool: {len(pool)}")
-
-    kept = gp.comm.bcast(kept, root=0)
+                cluster[name] = pool.pop(name)
+        best = _select(cluster, energy_key)
+        kept[best] = cluster[best]
     return kept
