@@ -18,11 +18,16 @@ import logging
 import random
 from collections import defaultdict
 
+from mpi4py import MPI
 from ase.atoms import Atoms
 from pymatgen.analysis.structure_matcher import StructureMatcher
 from pymatgen.io.ase import AseAtomsAdaptor
 
 import gnrs.parallel as gp
+
+_TAG_WORK = 50
+_TAG_RESULT = 51
+_TAG_SHUTDOWN = 52
 
 logger = logging.getLogger("dedup")
 
@@ -120,6 +125,64 @@ def _scatter_structs(pool: dict[str, Atoms]) -> dict[str, Atoms]:
             scatter_list.append(dict(items[start : start + chunk]))
             start += chunk
     return gp.comm.scatter(scatter_list, root=0)
+
+
+def dedup_parallel(
+    all_buckets: list[dict[str, Atoms]],
+    matcher: StructureMatcher,
+    energy_key: str | None,
+) -> dict[str, Atoms]:
+    """
+    Dispatch buckets dynamically to worker ranks (rank 0 = dispatcher).
+    Each worker processes one bucket at a time and requests the next
+    when done. No MPI inside the per-bucket dedup loop.
+
+    Args:
+        all_buckets: List of buckets (only meaningful on rank 0).
+        matcher: StructureMatcher instance.
+        energy_key: Energy key for selecting best duplicate.
+
+    Returns:
+        Combined unique structures (all ranks).
+    """
+    if gp.is_master:
+        queue = list(all_buckets)
+        kept = {}
+        active = gp.size - 1  # worker ranks 1..size-1
+
+        # Send initial bucket to each worker
+        for worker in range(1, gp.size):
+            if queue:
+                gp.comm.send(queue.pop(0), dest=worker, tag=_TAG_WORK)
+            else:
+                gp.comm.send(None, dest=worker, tag=_TAG_SHUTDOWN)
+                active -= 1
+
+        while active > 0:
+            status = MPI.Status()
+            result = gp.comm.recv(source=MPI.ANY_SOURCE, tag=_TAG_RESULT, status=status)
+            kept.update(result)
+            worker = status.Get_source()
+            if queue:
+                gp.comm.send(queue.pop(0), dest=worker, tag=_TAG_WORK)
+            else:
+                gp.comm.send(None, dest=worker, tag=_TAG_SHUTDOWN)
+                active -= 1
+
+        return gp.comm.bcast(kept, root=0)
+
+    else:
+        kept = {}
+        while True:
+            status = MPI.Status()
+            bucket = gp.comm.recv(source=0, tag=MPI.ANY_TAG, status=status)
+            if status.Get_tag() == _TAG_SHUTDOWN:
+                break
+            kept.update(dedup_bucket(bucket, matcher, energy_key))
+            gp.comm.send(kept, dest=0, tag=_TAG_RESULT)
+            kept = {}  # reset after sending
+
+        return gp.comm.bcast(None, root=0)
 
 
 def dedup_bucket(

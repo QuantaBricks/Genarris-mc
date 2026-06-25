@@ -20,7 +20,7 @@ import gnrs.output as gout
 import gnrs.parallel as gp
 from gnrs.core.task import TaskABC
 from gnrs.parallel.structs import DistributedStructs
-from gnrs.deduplication.dedup import group_by_spg, group_by_volume, dedup_bucket
+from gnrs.deduplication.dedup import group_by_spg, group_by_volume, dedup_parallel
 
 logger = logging.getLogger("DuplicateRemovalTask")
 
@@ -112,9 +112,8 @@ class DuplicateRemovalTask(TaskABC):
 
         all_structs = gp.comm.gather(self.structs, root=0)
 
-        # Build all volume buckets on master, scatter to ranks
-        buckets = None
-        n_structs = 0
+        # Build all volume buckets on master
+        all_buckets = []
         if gp.is_master:
             combined = {}
             for d in all_structs:
@@ -124,32 +123,16 @@ class DuplicateRemovalTask(TaskABC):
             if use_spg_groups:
                 spg_groups = group_by_spg(combined)
                 gout.emit(f"Deduplicating {n_structs} structures across {len(spg_groups)} space groups")
-                all_buckets = []
                 for pool in spg_groups.values():
                     all_buckets.extend(group_by_volume(pool))
             else:
                 gout.emit(f"Deduplicating all {n_structs} structures")
                 all_buckets = group_by_volume(combined)
 
-            # Distribute buckets round-robin across ranks
-            buckets = [[] for _ in range(gp.size)]
-            for i, bucket in enumerate(all_buckets):
-                buckets[i % gp.size].append(bucket)
-
-        my_buckets = gp.comm.scatter(buckets, root=0)
-
-        # Each rank deduplicates its buckets independently — no MPI inside
-        kept = {}
-        for bucket in my_buckets:
-            kept.update(dedup_bucket(bucket, matcher, energy_key))
-
-        # Gather unique structures from all ranks
-        all_kept = gp.comm.gather(kept, root=0)
-        unique = {}
-        if gp.is_master:
-            for d in all_kept:
-                unique.update(d)
-        unique = gp.comm.bcast(unique, root=0)
+        unique = dedup_parallel(
+            all_buckets if gp.is_master else [],
+            matcher, energy_key,
+        )
 
         # Scatter deduplicated pool back across ranks
         ds = DistributedStructs(unique)
