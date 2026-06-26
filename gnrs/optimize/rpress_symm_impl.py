@@ -227,6 +227,7 @@ class RigidPressSymm:
         # Interaction distance = mol length + 2x max cutoff
         self.D = self.mol_length + 2 * np.max(self.radius)
         self.an = xtal.get_atomic_numbers().tolist()
+        self._last_energy = np.inf
 
     def find_pairs(self, xtal: Atoms) -> dict:
         """
@@ -305,6 +306,164 @@ class RigidPressSymm:
             weight * (self.D - dist) / (dist - radius)
         )[(dist > radius) & (dist < self.D)]
         return energy.sum()
+
+    def _kernel_energy_and_dEdr(
+        self, dist_flat: np.ndarray, radius_flat: np.ndarray, weight: float
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Return per-pair (energy, dE/dr) arrays for the repulsive kernel.
+
+        The kernel is  weight*(D-r)/(r-sigma) for sigma < r < D, inf for r <= sigma.
+        Its derivative w.r.t. distance: -weight*(D-sigma)/(r-sigma)^2.
+        """
+        e = np.zeros(len(dist_flat))
+        dedr = np.zeros(len(dist_flat))
+        inf_mask = dist_flat < radius_flat
+        mid_mask = (dist_flat > radius_flat) & (dist_flat < self.D)
+        e[inf_mask] = np.inf
+        d = dist_flat[mid_mask]
+        r = radius_flat[mid_mask]
+        gap = d - r
+        e[mid_mask] = weight * (self.D - d) / gap
+        dedr[mid_mask] = -weight * (self.D - r) / gap ** 2
+        return e, dedr
+
+    def pair_energy_and_forces(
+        self, xtal: Atoms, mol1: int, mol2: int, weight: float, interact_pairs: dict
+    ) -> tuple[float, np.ndarray, np.ndarray]:
+        """
+        Compute interaction energy, Cartesian atomic forces, and lattice stress tensor
+        for one molecule pair.
+
+        Forces are accumulated into a zeroed array of shape (n_atoms_crystal, 3).
+        The lattice stress T[c,b] = Σ_{p,i,j} (-dedr)*r̂[b]*p[c] captures the direct
+        dependence of pair energy on the cell matrix L through periodic displacements
+        p@L.  It must be contracted with dL/d(state) to complete the gradient.
+
+        Returns (np.inf, zeros, zeros) if any atom overlap is detected.
+        """
+        na = self.natoms
+        lattice = xtal.cell.array
+        pairs = interact_pairs[(mol1, mol2)]
+        forces = np.zeros_like(xtal.positions)
+        T = np.zeros((3, 3))
+        if len(pairs) == 0:
+            return 0.0, forces, T
+
+        pos1 = xtal.positions[mol1 * na : (mol1 + 1) * na]  # (na, 3)
+        pos2 = xtal.positions[mol2 * na : (mol2 + 1) * na]  # (na, 3)
+
+        lattice_disps = pairs @ lattice  # (np, 3)
+        np_ = len(lattice_disps)
+
+        # Stack all displaced copies of mol2: (np*na, 3)
+        pos2_all = pos2[np.newaxis, :, :] + lattice_disps[:, np.newaxis, :]
+        pos2_flat = pos2_all.reshape(-1, 3)
+
+        dist = cdist(pos1, pos2_flat)  # (na, np*na)
+        radius_2d = np.tile(self.radius.reshape(na, na), (1, np_))  # (na, np*na)
+
+        e_arr, dedr_arr = self._kernel_energy_and_dEdr(
+            dist.ravel(), radius_2d.ravel(), weight
+        )
+        if np.any(np.isinf(e_arr)):
+            return np.inf, forces, T
+
+        total_e = e_arr.sum()
+
+        # dr[i, kj, :] = pos1[i] - pos2_flat[kj]  shape: (na, np*na, 3)
+        dr = pos1[:, np.newaxis, :] - pos2_flat[np.newaxis, :, :]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            r_hat = np.where(
+                dist[:, :, np.newaxis] > 0, dr / dist[:, :, np.newaxis], 0.0
+            )  # (na, np*na, 3)
+
+        dedr_2d = dedr_arr.reshape(na, np_ * na)
+        dedr_3d = dedr_2d.reshape(na, np_, na)          # (na_1, np, na_2)
+        neg_dedr_3d = -dedr_3d                          # (na_1, np, na_2)
+        r_hat_4d = r_hat.reshape(na, np_, na, 3)        # (na_1, np, na_2, 3)
+
+        # dE/d(pos1[i]) = Σ_{kj} dedr[i,kj] * r_hat[i,kj]  → force: subtract
+        grad_mol1 = np.einsum("ij,ijk->ik", dedr_2d, r_hat)  # (na, 3)
+        forces[mol1 * na : (mol1 + 1) * na] -= grad_mol1
+
+        # dE/d(pos2[j]) = Σ_{i,k} dedr[i,kj] * r_hat[i,kj]  → force: add
+        # (dedr < 0 and r̂ points from mol2 to mol1, so force pushes mol2 away)
+        grad_mol2 = np.einsum("ikj,ikjl->jl", dedr_3d, r_hat_4d)  # (na_2, 3)
+        forces[mol2 * na : (mol2 + 1) * na] += grad_mol2
+
+        # Lattice stress: T[c,b] = Σ_{p,i,j} (-dedr)*r̂[b]*pairs[p,c]
+        # R_p[p,b] = Σ_{i,j} (-dedr[i,p,j]) * r̂[i,p,j,b]  shape: (np, 3)
+        R_p = np.einsum("ikj,ikjl->kl", neg_dedr_3d, r_hat_4d)
+        T = pairs.T @ R_p  # (3, np) @ (np, 3) = (3, 3);  T[c,b]
+
+        return total_e, forces, T
+
+    def total_energy_and_grad(self, state: np.ndarray) -> tuple[float, np.ndarray]:
+        """
+        Compute total energy and gradient w.r.t. the state vector.
+
+        Returns (energy, grad) so it can be passed as ``fun`` with ``jac=True``
+        to scipy.optimize.minimize.
+
+        Analytical atomic forces are computed from pair interactions; the
+        gradient w.r.t. the reduced state vector is obtained by contracting
+        those forces with the position Jacobian d(cart_positions)/d(state),
+        which is evaluated cheaply via finite differences of create_xtal()
+        (no pair-distance computations involved).
+        """
+        state_copy = np.array(state, dtype=float)
+        state_std = self.standardize_state(state_copy)
+        xtal = self.create_xtal(state_std)
+
+        interact_pairs = self.find_pairs(xtal)
+        if "inf" in interact_pairs:
+            self._last_energy = np.inf
+            return np.inf, np.zeros(len(state))
+
+        forces = np.zeros_like(xtal.positions)
+        T_total = np.zeros((3, 3))
+        energy = 0.0
+        w_pair = self.int_scale / (self.natoms * self.natoms)
+
+        for key in interact_pairs:
+            mol1, mol2 = key
+            e, f, T = self.pair_energy_and_forces(xtal, mol1, mol2, w_pair, interact_pairs)
+            if np.isinf(e):
+                self._last_energy = np.inf
+                return np.inf, np.zeros(len(state))
+            energy += e
+            forces += f
+            T_total += T
+
+        V = xtal.get_volume()
+        energy += V
+        self._last_energy = energy
+
+        # Cheap finite-difference Jacobian: d(cart_positions)/d(state_k) and
+        # d(cell_matrix)/d(state_k).  create_xtal() is pure geometry so this is fast.
+        pos0 = xtal.positions.ravel()
+        L0 = xtal.cell.array
+        n_state = len(state_std)
+        J = np.zeros((len(pos0), n_state))
+        dV_dstate = np.zeros(n_state)
+        dL_dstate = np.zeros((3, 3, n_state))
+        eps = 1e-6
+        for k in range(n_state):
+            s_p = state_std.copy()
+            s_p[k] += eps
+            xtal_p = self.create_xtal(s_p)
+            J[:, k] = (xtal_p.positions.ravel() - pos0) / eps
+            dV_dstate[k] = (xtal_p.get_volume() - V) / eps
+            dL_dstate[:, :, k] = (xtal_p.cell.array - L0) / eps
+
+        # Full gradient:
+        #   dE/d(state[k]) = J^T @ (-forces)          [atom-position contribution]
+        #                   + T_total : dL/d(state[k]) [periodic-displacement contribution]
+        #                   + dV/d(state[k])           [volume contribution]
+        lat_stress = np.einsum("cb,cbk->k", T_total, dL_dstate)
+        grad_state = J.T @ (-forces.ravel()) + lat_stress + dV_dstate
+        return energy, grad_state
 
     def pair_energy(
         self, xtal: Atoms, mol1: int, mol2: int, weight: float, interact_pairs: dict
@@ -556,13 +715,11 @@ class RigidPressSymm:
         Args:
             xk: Current state vector
         """
-        # Avoid volume converge to small values
-        if self.objective_function(xk) < self.vol_tol:
+        if self._last_energy < self.vol_tol:
             if self.debug_flag:
                 self.logger.debug(f"Failed optimization in {self.rank}")
             raise StopIteration("Custom stopping condition met")
-        else:
-            return self.standardize_state(xk)
+        return self.standardize_state(xk)
 
     def objective_function(self, state: np.ndarray) -> float:
         """
@@ -593,15 +750,16 @@ class RigidPressSymm:
             state_std = self.standardize_state(state)
 
             # Check if initial state is valid
-            energy = self.total_energy(state_std)
+            energy, _ = self.total_energy_and_grad(state_std)
             if np.isinf(energy):
                 return False
 
-            # Run optimization
+            # Run optimization with analytical gradient (jac=True: fun returns (f, grad))
             res = minimize(
-                self.objective_function,
+                self.total_energy_and_grad,
                 state,
                 method=self.method,
+                jac=True,
                 tol=self.tol,
                 options={"disp": self.debug_flag, "maxiter": self.maxiter},
                 callback=self.callback,

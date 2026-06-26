@@ -56,14 +56,15 @@ def group_by_volume(
 ) -> list[dict[str, Atoms]]:
     """
     Sub-group structures by unit cell volume within a relative tolerance.
-    Structures whose volumes differ by more than vol_tol cannot be duplicates.
+    Adjacent buckets share a small overlap zone so duplicates straddling a
+    bucket boundary are still compared in both buckets.
 
     Args:
         structs: {name: Atoms}.
         vol_tol: Relative volume tolerance (default 0.05 = 5%).
 
     Returns:
-        List of sub-group dicts.
+        List of sub-group dicts (with overlap).
     """
     items = sorted(structs.items(), key=lambda kv: kv[1].get_volume())
     buckets: list[dict[str, Atoms]] = []
@@ -78,6 +79,25 @@ def group_by_volume(
                 break
         if not placed:
             buckets.append({name: xtal})
+
+    # Overlap: bidirectionally copy boundary structures into the adjacent bucket.
+    # Measure gap using the actual max/min volumes (not ref) so even skewed buckets
+    # are handled correctly. Structures appear in two buckets and are compared in
+    # both; since _select() is deterministic the same winner is chosen in each.
+    for i in range(len(buckets) - 1):
+        max_vol_i = max(x.get_volume() for x in buckets[i].values())
+        min_vol_i1 = min(x.get_volume() for x in buckets[i + 1].values())
+        if abs(max_vol_i - min_vol_i1) / min_vol_i1 > vol_tol:
+            continue  # well-separated buckets need no overlap
+        snap_i = list(buckets[i].items())
+        snap_i1 = list(buckets[i + 1].items())
+        for name, xtal in snap_i:
+            if abs(xtal.get_volume() - min_vol_i1) / min_vol_i1 <= vol_tol:
+                buckets[i + 1][name] = xtal
+        for name, xtal in snap_i1:
+            if abs(xtal.get_volume() - max_vol_i) / max_vol_i <= vol_tol:
+                buckets[i][name] = xtal
+
     return buckets
 
 
