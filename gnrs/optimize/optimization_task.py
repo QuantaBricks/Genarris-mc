@@ -18,7 +18,7 @@ import logging
 from mpi4py import MPI
 import gnrs.output as gout
 from gnrs.core.task import TaskABC
-from gnrs.parallel.io import read_parallel
+from gnrs.parallel.io import read_parallel, write_from_checkpoints
 from gnrs.parallel.structs import DistributedStructs
 from gnrs.gnrsutil.molecule_bonding import get_vdw_distance_cutoff_matrix
 
@@ -217,7 +217,8 @@ class GeometryOptimizationTask(TaskABC):
         gout.emit("Completed optimizations.")
 
     def collect_results(self):
-        super().collect_results()
+        write_from_checkpoints(self.struct_path, self.calc_dir)
+        self.comm.Barrier()
 
     def analyze(self) -> None:
         """

@@ -10,8 +10,10 @@ __author__ = ["Yi Yang", "Rithwik Tom"]
 __email__ = "yiy5@andrew.cmu.edu"
 __group__ = "https://www.noamarom.com/"
 
+import json
 import logging
 import random
+from pathlib import Path
 
 from ase import Atoms
 from ase.io.jsonio import encode, decode
@@ -121,6 +123,32 @@ def write_parallel(file_path: str, struct_dict: dict,
             wfile.write("{\n")
             wfile.writelines(str_list)
             wfile.write("\n}")
+
+
+def write_from_checkpoints(file_path: str, checkpoint_dir: str, mode: str = "w") -> None:
+    """
+    Master reads all checkpoint .save files and writes combined JSON.
+    No MPI communication needed — avoids gather bottleneck.
+    """
+    if not gp.is_master:
+        return
+    save_files = sorted(Path(checkpoint_dir).rglob("*.save"))
+    if not save_files:
+        logger.info("No checkpoint files found!")
+        return
+    entries = []
+    for sf in save_files:
+        with open(sf) as f:
+            data = json.load(f)
+        for name, enc_str in data.items():
+            entries.append((name, enc_str))
+    logger.info(f"Writing {len(entries)} structures from checkpoints to {file_path}")
+    with open(file_path, mode) as wfile:
+        wfile.write("{\n")
+        for i, (name, enc_str) in enumerate(entries):
+            comma = "," if i < len(entries) - 1 else ""
+            wfile.write(f'"{name}": {enc_str}{comma}\n')
+        wfile.write("}")
 
 
 def read_parallel(file_path: str, scatter: bool = True) -> dict:
