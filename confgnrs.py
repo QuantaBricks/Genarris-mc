@@ -55,8 +55,11 @@ import json
 import os
 import shutil
 import subprocess
+import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from configparser import ConfigParser
+
+warnings.filterwarnings("ignore", category=FutureWarning, module="ase")
 
 KCAL_PER_HARTREE = 627.509474
 WIDTH = 80
@@ -90,6 +93,9 @@ def load_config(config_path: str):
         "seed":                   int(c.get("seed", 42)),
         "num_structures_per_spg": int(c.get("num_structures_per_spg", 20)),
         "mpi_np":                 int(c.get("mpi_np", 4)),
+        # Top-3 most common organic crystal space groups by CSD frequency:
+        # P2₁/c (#14, ~36%), P-1 (#2, ~16%), P2₁2₁2₁ (#19, ~11%)
+        "micro_csp_spgs":         c.get("micro_csp_spgs", "14,2,19"),
     }
     return cfg, cp
 
@@ -98,12 +104,12 @@ _MICRO_TASKS = "['generation', 'symm_rigid_press', 'dedup']"
 _SKIP_SECTIONS = {"conformer", "workflow"}
 
 
-def write_cf_conf(src_cp: ConfigParser, folder_name: str, num_spg: int, out_path: str):
+def write_cf_conf(src_cp: ConfigParser, folder_name: str, num_spg: int, out_path: str, micro_csp_spgs: str = "14,2,19"):
     """Write micro-cfX/inp.conf.
 
     - [master]: passthrough + override name/molecule_path
     - [workflow]: hardcoded to generation → symm_rigid_press → dedup
-    - [generation]: passthrough + override num_structures_per_spg
+    - [generation]: passthrough + override num_structures_per_spg and spg_distribution_type
     - [symm_rigid_press], [dedup], others: passthrough verbatim
     - [conformer]: skipped
     """
@@ -126,10 +132,12 @@ def write_cf_conf(src_cp: ConfigParser, folder_name: str, num_spg: int, out_path
     out.add_section("workflow")
     out.set("workflow", "tasks", _MICRO_TASKS)
 
-    # [generation] override
+    # [generation] overrides: only one SPG for fast conformer ranking
     if not out.has_section("generation"):
         out.add_section("generation")
     out.set("generation", "num_structures_per_spg", str(num_spg))
+    spg_list = "[" + micro_csp_spgs + "]"
+    out.set("generation", "spg_distribution_type", spg_list)
 
     with open(out_path, "w") as fh:
         out.write(fh)
@@ -392,6 +400,7 @@ def main():
             folder_name=folder_name,
             num_spg=cfg["num_structures_per_spg"],
             out_path=os.path.join(folder, "inp.conf"),
+            micro_csp_spgs=cfg["micro_csp_spgs"],
         )
 
         rel = (e - e_min) * KCAL_PER_HARTREE
