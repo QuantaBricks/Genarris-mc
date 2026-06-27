@@ -53,52 +53,58 @@ def group_by_spg(structs: dict[str, Atoms]) -> dict[int, dict[str, Atoms]]:
 def group_by_volume(
     structs: dict[str, Atoms],
     vol_tol: float = 0.05,
+    n_buckets: int = 10,
 ) -> list[dict[str, Atoms]]:
     """
-    Sub-group structures by unit cell volume within a relative tolerance.
-    Adjacent buckets share a small overlap zone so duplicates straddling a
-    bucket boundary are still compared in both buckets.
+    Sub-group structures by unit cell volume into exactly n_buckets equal-width
+    bins. Adjacent buckets share a small overlap so duplicates straddling a
+    boundary are compared in both buckets.
 
     Args:
         structs: {name: Atoms}.
-        vol_tol: Relative volume tolerance (default 0.05 = 5%).
+        vol_tol: Relative overlap half-width at bucket boundaries.
+        n_buckets: Number of buckets to split into (default 10).
 
     Returns:
         List of sub-group dicts (with overlap).
     """
+    if not structs:
+        return []
+
     items = sorted(structs.items(), key=lambda kv: kv[1].get_volume())
-    buckets: list[dict[str, Atoms]] = []
+    vols = [xtal.get_volume() for _, xtal in items]
+    v_min, v_max = vols[0], vols[-1]
+
+    if v_min == v_max:
+        return [dict(items)]
+
+    n = min(n_buckets, len(items))
+    edges = [v_min + (v_max - v_min) * i / n for i in range(n + 1)]
+    # Expand edges slightly so boundary structures fall inside a bucket.
+    edges[0] -= 1e-6
+    edges[-1] += 1e-6
+
+    buckets: list[dict[str, Atoms]] = [dict() for _ in range(n)]
     for name, xtal in items:
         vol = xtal.get_volume()
-        placed = False
-        for bucket in buckets:
-            ref_vol = next(iter(bucket.values())).get_volume()
-            if abs(vol - ref_vol) / ref_vol <= vol_tol:
-                bucket[name] = xtal
-                placed = True
+        for k in range(n):
+            if edges[k] < vol <= edges[k + 1]:
+                buckets[k][name] = xtal
                 break
-        if not placed:
-            buckets.append({name: xtal})
 
-    # Overlap: bidirectionally copy boundary structures into the adjacent bucket.
-    # Measure gap using the actual max/min volumes (not ref) so even skewed buckets
-    # are handled correctly. Structures appear in two buckets and are compared in
-    # both; since _select() is deterministic the same winner is chosen in each.
-    for i in range(len(buckets) - 1):
-        max_vol_i = max(x.get_volume() for x in buckets[i].values())
-        min_vol_i1 = min(x.get_volume() for x in buckets[i + 1].values())
-        if abs(max_vol_i - min_vol_i1) / min_vol_i1 > vol_tol:
-            continue  # well-separated buckets need no overlap
-        snap_i = list(buckets[i].items())
-        snap_i1 = list(buckets[i + 1].items())
-        for name, xtal in snap_i:
-            if abs(xtal.get_volume() - min_vol_i1) / min_vol_i1 <= vol_tol:
+    # Overlap: copy boundary structures into the adjacent bucket so duplicates
+    # straddling a boundary edge are still compared in both buckets.
+    overlap_width = vol_tol * (v_max - v_min) / n
+    for i in range(n - 1):
+        boundary = edges[i + 1]
+        for name, xtal in list(buckets[i].items()):
+            if boundary - xtal.get_volume() <= overlap_width:
                 buckets[i + 1][name] = xtal
-        for name, xtal in snap_i1:
-            if abs(xtal.get_volume() - max_vol_i) / max_vol_i <= vol_tol:
+        for name, xtal in list(buckets[i + 1].items()):
+            if xtal.get_volume() - boundary <= overlap_width:
                 buckets[i][name] = xtal
 
-    return buckets
+    return [b for b in buckets if b]
 
 
 def _select(
@@ -216,6 +222,7 @@ def dedup_bucket(
     bucket: dict[str, Atoms],
     matcher: StructureMatcher,
     energy_key: str | None,
+    energy_tol: float = 0.01,
 ) -> dict[str, Atoms]:
     """
     Deduplicate a single volume bucket on one rank, no MPI.
@@ -224,18 +231,33 @@ def dedup_bucket(
         bucket: {name: Atoms} structures in this volume bucket.
         matcher: Configured StructureMatcher instance.
         energy_key: Key in Atoms.info for energy, or None.
+        energy_tol: If both structures have finite energies differing by more
+            than this (eV), skip StructureMatcher and treat as non-duplicate.
 
     Returns:
         {name: Atoms} unique structures.
     """
+    import math
+
     pool = dict(bucket)
     kept = {}
     while pool:
         ref_name, ref_xtal = next(iter(pool.items()))
         pool.pop(ref_name)
         pmg_ref = AseAtomsAdaptor.get_structure(ref_xtal)
+        e_ref = ref_xtal.info.get(energy_key) if energy_key else None
+        if e_ref is not None:
+            e_ref = float(e_ref)
+            if math.isinf(e_ref):
+                e_ref = None
         cluster = {ref_name: ref_xtal}
         for name in list(pool.keys()):
+            if e_ref is not None:
+                e = pool[name].info.get(energy_key)
+                if e is not None:
+                    e = float(e)
+                    if not math.isinf(e) and abs(e - e_ref) > energy_tol:
+                        continue
             pmg_xtal = AseAtomsAdaptor.get_structure(pool[name])
             if matcher.fit(pmg_ref, pmg_xtal):
                 cluster[name] = pool.pop(name)
