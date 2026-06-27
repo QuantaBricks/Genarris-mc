@@ -769,6 +769,8 @@ class RigidPressSymm:
             xtal_opt = self.create_xtal(res.x)
             xtal.set_cell(xtal_opt.cell)
             xtal.set_positions(xtal_opt.positions)
+            if res.success:
+                xtal.info['press_energy'] = float(res.fun)
             return res.success
         except (StopIteration, RuntimeError):
             return False

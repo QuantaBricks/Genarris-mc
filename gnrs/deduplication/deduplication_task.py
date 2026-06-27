@@ -72,7 +72,7 @@ class DuplicateRemovalTask(TaskABC):
             "stol": cfg.get("stol", 0.5),
             "ltol": cfg.get("ltol", 0.5),
             "angle_tol": cfg.get("angle_tol", 10),
-            "energy_key": cfg.get("energy_key", None),
+            "energy_key": cfg.get("energy_key", "press_energy"),
             "group_by_spg": cfg.get("group_by_spg", True),
         }
         return task_set
