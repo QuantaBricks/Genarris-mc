@@ -16,11 +16,14 @@ import logging
 import subprocess
 import textwrap
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 import numpy as np
-from mpi4py import MPI
 
 from gnrs.output.templates import ascii_art, citation_v2, citation_v3, pymove
+
+if TYPE_CHECKING:
+    from mpi4py import MPI
 
 width = 100
 logger = logging.getLogger("genarris")

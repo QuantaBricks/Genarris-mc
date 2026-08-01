@@ -12,9 +12,12 @@ __group__ = "https://www.noamarom.com/"
 
 import logging
 import random
+from typing import TYPE_CHECKING
 
 import numpy as np
-from mpi4py import MPI
+
+if TYPE_CHECKING:
+    from mpi4py import MPI
 
 logger = logging.getLogger("parallel")
 

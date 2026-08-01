@@ -165,7 +165,16 @@ rigid_press = Extension(
     swig_opts=["-I./gnrs/cgenarris/src/rpack/rigid_press", "-I./gnrs/cgenarris/src/spglib_src"],
 )
 
+# Add press_kernel extension (C-accelerated energy/gradient for symm_rigid_press)
+numpy_include = importlib.import_module("numpy").get_include()
+press_kernel = Extension(
+    "gnrs.optimize._press_kernel",
+    include_dirs=[numpy_include],
+    sources=["gnrs/optimize/press_kernel.c"],
+    extra_compile_args=["-O3"],
+)
+
 setup(
-    ext_modules=[pygenarris_mpi, rigid_press],
+    ext_modules=[pygenarris_mpi, rigid_press, press_kernel],
     zip_safe=False,
 )
