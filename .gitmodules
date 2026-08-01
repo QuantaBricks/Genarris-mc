@@ -1,4 +1,0 @@
-[submodule "gnrs/cgenarris"]
-	path = gnrs/cgenarris
-	url = https://github.com/Yi5817/cgenarris.git
-	branch = crystal
